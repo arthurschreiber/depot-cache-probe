@@ -1,0 +1,68 @@
+name: Depot cache probe
+
+# Temporary. Checks whether a pull request from a fork, running on a Depot
+# runner, can save a cache entry that a trusted run (a push to a branch of the
+# base repository) then restores. Saves and restores a harmless marker file.
+on:
+  pull_request:
+  push:
+    branches:
+      - "arthur/depot-cache-probe-restore"
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: depot-ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Describe the run
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
+        run: |
+          echo "event=${EVENT} ref=${REF} head_repo=${HEAD_REPO} fork=${IS_FORK}"
+          echo "runner=${RUNNER_NAME} environment=${RUNNER_ENVIRONMENT}"
+          # Host names only, never the tokens.
+          for v in ACTIONS_CACHE_URL ACTIONS_RESULTS_URL ACTIONS_CACHE_SERVICE_V2; do
+            val="${!v:-}"
+            echo "${v}=$(sed -E 's#^(https?://[^/]+).*#\1#' <<<"${val}")"
+          done
+          # The cache scopes GitHub grants this run ("ac" claim; Permission 1 = read,
+          # 2 = write). The payload holds no secret; the signature is not printed.
+          p="$(cut -d. -f2 <<<"${ACTIONS_RUNTIME_TOKEN:-}" | tr '_-' '/+')"
+          while [ $(( ${#p} % 4 )) -ne 0 ]; do p="${p}="; done
+          base64 -d <<<"${p}" | jq -r '.ac // "no ac claim"' || echo "could not decode the runtime token"
+
+      - name: Restore any probe entry (by prefix)
+        id: restore
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: probe
+          key: depot-cache-probe-none
+          restore-keys: depot-cache-probe-
+
+      - name: Show what was restored
+        env:
+          MATCHED: ${{ steps.restore.outputs.cache-matched-key }}
+        run: |
+          echo "matched key: ${MATCHED:-<none>}"
+          cat probe/marker 2>/dev/null || echo "no marker restored"
+
+      - name: Write the marker
+        if: github.event_name == 'pull_request'
+        env:
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          mkdir -p probe
+          echo "saved by ${GITHUB_EVENT_NAME} from ${HEAD_REPO} at ${GITHUB_REF}, run ${GITHUB_RUN_ID}" > probe/marker
+
+      - name: Save the marker
+        if: github.event_name == 'pull_request'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: probe
+          key: depot-cache-probe-${{ github.run_id }}
